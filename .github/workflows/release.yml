@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (X.Y.Z, matching VERSION)"
+        required: true
+        type: string
+        default: "0.1.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Run behavior tests
+        run: python -m unittest discover -s tests -v
+      - name: Build the installable skill and release notes
+        run: python scripts/build_release.py --version "$RELEASE_VERSION"
+      - name: Publish immutable version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            echo "Version $tag already exists; it will not be moved or overwritten." >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$tag" -m "$tag"
+          git push origin "refs/tags/$tag"
+          gh release create "$tag" "dist/session-to-md-$tag.zip" \
+            --verify-tag --title "$tag" --notes-file "dist/release-$tag.md" --latest
