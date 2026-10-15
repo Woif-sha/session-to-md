@@ -1,3 +1,7 @@
 {
-  "updatePolicy": "local-only"
+  "source": "Woif-sha/session-to-md",
+  "sourceType": "git",
+  "repoUrl": "https://github.com/Woif-sha/session-to-md",
+  "subpath": ".",
+  "installedBaseVersion": "d3ac8d10a575318c38be7e515c9ad9d1c665ecdd"
 }
