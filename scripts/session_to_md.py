@@ -8,7 +8,7 @@ see ../references/upstream.md and ../LICENSE.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import filecmp
@@ -33,8 +33,17 @@ CONTEXT_TAGS = (
 )
 CONTEXT_BLOCK = re.compile(
     r"^\s*<(?P<tag>" + "|".join(map(re.escape, CONTEXT_TAGS))
-    + r")(?:\s[^>]*)?>.*?</(?P=tag)>\s*", re.S,
+    + r")(?:\s[^>]*)?>.*?</(?P=tag)>", re.S,
 )
+AGENTS_BLOCK = re.compile(
+    r"^\s*# AGENTS\.md instructions(?: for [^\r\n]+)?[ \t]*\r?\n\s*"
+    r"(?:<INSTRUCTIONS>.*?</INSTRUCTIONS>|<!-- AGENTMD_START -->.*?<!-- AGENTMD_END -->)",
+    re.S,
+)
+INJECTED_CONTENT_KINDS = {
+    "agents_md.instructions", "environments.environment_context",
+    "additional_content.codex_apps_open_page",
+}
 
 
 @dataclass(frozen=True)
@@ -58,13 +67,20 @@ class Message:
     turn: str
     kind: str
     item_id: str | None = None
+    phase: str | None = None
+    raw_text: str = ""
+    authored: bool = False
+
+
+@dataclass
+class Conversation:
+    messages: list[Message]
+    completed_answers: dict[tuple[str, str], set[str]]
 
 
 def clean_response_text(text: str) -> str:
     """Remove leading harness blocks, leaving quoted/authored prose untouched."""
-    if text.startswith("# AGENTS.md instructions for "):
-        return ""
-    while match := CONTEXT_BLOCK.match(text):
+    while match := CONTEXT_BLOCK.match(text) or AGENTS_BLOCK.match(text):
         text = text[match.end():]
     return text
 
@@ -80,42 +96,87 @@ def text_content(content) -> str:
     )
 
 
+def user_content(payload: dict, content) -> tuple[str, bool]:
+    metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+    kinds = metadata.get("content_item_kinds", [])
+    if isinstance(content, list) and kinds and len(kinds) == len(content):
+        parts = []
+        for part, kind in zip(content, kinds):
+            if kind in INJECTED_CONTENT_KINDS:
+                continue
+            text = text_content([part])
+            parts.append(text if kind == "user.text" else clean_response_text(text))
+        return "\n\n".join(text for text in parts if text), "user.text" in kinds
+    return clean_response_text(text_content(content)), False
+
+
 def conversation_record(record: dict, session_id: str, turn: str) -> Message | None:
     payload = record.get("payload", {})
     record_type, item_type = record.get("type"), payload.get("type")
+    authored = False
     if record_type == "response_item" and item_type == "message":
         role = payload.get("role")
         if role not in {"user", "assistant"}:
             return None
-        text = text_content(payload.get("content"))
+        content = payload.get("content")
+        raw_text = text_content(content)
+        text = raw_text
         if role == "user":
-            text = clean_response_text(text)
+            text, authored = user_content(payload, content)
         kind = "response"
     elif record_type == "event_msg" and item_type in {"user_message", "agent_message"}:
         role = "user" if item_type == "user_message" else "assistant"
-        text = payload.get("message", "")
+        raw_text = text = payload.get("message", "")
+        if role == "user":
+            text, authored = user_content(payload, text)
         kind = "event"
     else:
         return None
     if not isinstance(text, str) or not text.strip():
         return None
-    return Message(role, text, session_id, turn, kind, payload.get("id"))
+    metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+    return Message(role, text, session_id, metadata.get("turn_id") or turn,
+                   kind, payload.get("id"), payload.get("phase"), raw_text, authored)
 
 
 def remove_mirrors(messages: list[Message]) -> list[Message]:
-    """Match mirror occurrences per turn, not globally by repeated text."""
-    def preferred(message):
-        return message.kind == ("event" if message.role == "user" else "response")
+    """Pair occurrences by raw or cleaned text; preserve provenance and phase."""
+    def keys(message):
+        return [(message.session_id, message.turn, message.role, text)
+                for text in dict.fromkeys((message.text.strip(), message.raw_text.strip()))]
 
-    available = Counter(
-        (m.session_id, m.turn, m.role, m.text.strip()) for m in messages if preferred(m)
-    )
+    events = defaultdict(deque)
+    for index, message in enumerate(messages):
+        if message.kind == "event":
+            for key in keys(message):
+                events[key].append(index)
+    paired = set()
+    replacements = {}
+    for index, response in enumerate(messages):
+        if response.kind != "response":
+            continue
+        for key in keys(response):
+            candidates = events[key]
+            while candidates and candidates[0] in paired:
+                candidates.popleft()
+            if not candidates:
+                continue
+            event_index = candidates.popleft()
+            event = messages[event_index]
+            if response.role == "assistant":
+                chosen = replace(response, phase=response.phase or event.phase)
+            else:
+                chosen = response if response.authored else event
+            paired.update((index, event_index))
+            replacements[min(index, event_index)] = chosen
+            break
+
     seen_ids = set()
     result = []
-    for message in messages:
-        key = message.session_id, message.turn, message.role, message.text.strip()
-        if not preferred(message) and available[key]:
-            available[key] -= 1
+    for index, message in enumerate(messages):
+        if index in replacements:
+            message = replacements[index]
+        elif index in paired:
             continue
         if message.item_id:
             identity = message.session_id, message.turn, message.role, message.item_id
@@ -263,7 +324,8 @@ class SessionStore:
 
     def segment_messages(self, source: Source, end: int | None):
         messages = []
-        turn = "initial"
+        completed_answers = {}
+        turn = f"initial:{source.rollout_id}"
         paginated = source.meta.get("history_mode") == "paginated"
         base = source.meta.get("history_base")
         expected = base["end_ordinal_exclusive"] if base else 0
@@ -279,12 +341,18 @@ class SessionStore:
                 record.get("type") == "event_msg" and payload.get("type") == "task_started"
             ):
                 turn = payload.get("turn_id") or turn
+            if record.get("type") == "event_msg" and payload.get("type") == "task_complete":
+                key = source.session_id, payload.get("turn_id") or turn
+                completed = completed_answers.setdefault(key, set())
+                final_text = payload.get("last_agent_message")
+                if isinstance(final_text, str) and final_text.strip():
+                    completed.add(final_text.strip())
             message = conversation_record(record, source.session_id, turn)
             if message:
                 messages.append(message)
-        return messages
+        return Conversation(messages, completed_answers)
 
-    def history(self, source: Source, end=None, stack=()) -> list[Message]:
+    def history(self, source: Source, end=None, stack=()) -> Conversation:
         if source.rollout_id in stack:
             raise ExportError(f"Cyclic history reference: {source.rollout_id}")
         stack = (*stack, source.rollout_id)
@@ -297,29 +365,75 @@ class SessionStore:
             self.lineages[source.rollout_id] = list(dict.fromkeys(
                 self.lineages[parent.rollout_id] + [source.session_id]
             ))
-            if inherited and parent.session_id == source.session_id:
-                own = [replace(m, turn=inherited[-1].turn) if m.turn == "initial" else m for m in own]
-            return inherited + own
+            if inherited.messages and parent.session_id == source.session_id:
+                initial = f"initial:{source.rollout_id}"
+                last_turn = inherited.messages[-1].turn
+                own.messages = [replace(m, turn=last_turn) if m.turn == initial else m for m in own.messages]
+                pending = own.completed_answers.pop((source.session_id, initial), None)
+                if pending is not None:
+                    own.completed_answers.setdefault((source.session_id, last_turn), set()).update(pending)
+            for key, completed in inherited.completed_answers.items():
+                own.completed_answers.setdefault(key, set()).update(completed)
+            return Conversation(inherited.messages + own.messages, own.completed_answers)
         if parent_id := source.meta.get("forked_from_id"):
             # Copied forks already contain their inherited text. Match a verified
             # parent prefix to assign source sections, never append it a second time.
             parent = self.current(parent_id)
-            inherited = remove_mirrors(self.history(parent, stack=stack))
+            parent_history = self.history(parent, stack=stack)
+            inherited = remove_mirrors(parent_history.messages)
             self.lineages[source.rollout_id] = list(dict.fromkeys(
                 self.lineages[parent.rollout_id] + [source.session_id]
             ))
-            own = remove_mirrors(own)
+            own.messages = remove_mirrors(own.messages)
             matched = 0
-            for left, right in zip(inherited, own):
+            for left, right in zip(inherited, own.messages):
                 if (left.role, left.text) != (right.role, right.text):
                     break
-                own[matched] = replace(right, session_id=left.session_id)
+                own.messages[matched] = replace(
+                    right, session_id=left.session_id, turn=left.turn,
+                    phase=left.phase if left.phase is not None else right.phase,
+                )
+                old_key, key = (right.session_id, right.turn), (left.session_id, left.turn)
+                if old_key != key and old_key in own.completed_answers:
+                    own.completed_answers.setdefault(key, set()).update(own.completed_answers.pop(old_key))
+                # Borrow evidence only for an inherited answer actually copied,
+                # never for the parent's later conversation or a future answer.
+                parent_completed = parent_history.completed_answers.get(key)
+                if parent_completed is not None:
+                    if not parent_completed:
+                        own.completed_answers.setdefault(key, set())
+                    elif left.role == "assistant" and left.text.strip() in parent_completed:
+                        own.completed_answers.setdefault(key, set()).add(left.text.strip())
                 matched += 1
             if inherited and not matched:
                 raise ExportError(f"Cannot establish copied history boundary for {source.session_id}")
             return own
         self.lineages[source.rollout_id] = [source.session_id]
         return own
+
+    def final_conversation(self, conversation: Conversation) -> list[Message]:
+        selected = []
+        for message in remove_mirrors(conversation.messages):
+            if message.role == "user" or message.phase == "final_answer":
+                selected.append(message)
+            elif message.phase == "commentary":
+                continue
+            elif message.phase is None:
+                completed = conversation.completed_answers.get((message.session_id, message.turn))
+                if completed is None:
+                    raise ExportError(f"Cannot identify final answer in session {message.session_id}, turn {message.turn}")
+                if message.text.strip() in completed:
+                    selected.append(message)
+            else:
+                raise ExportError(f"Unsupported assistant phase: {message.phase}")
+        originals = defaultdict(set)
+        for message in selected:
+            if message.role == "assistant":
+                originals[message.session_id, message.turn].add(message.text.strip())
+        for key, completed in conversation.completed_answers.items():
+            if completed - originals[key]:
+                raise ExportError(f"Missing original final answer in session {key[0]}, turn {key[1]}")
+        return selected
 
 
 def format_time(value: str | None) -> str:
@@ -335,7 +449,7 @@ def export_session(session_id: str, codex_home: Path, output_dir: Path) -> Path:
     session_id = str(UUID(session_id))
     store = SessionStore(codex_home)
     source = store.current(session_id)
-    messages = remove_mirrors(store.history(source))
+    messages = store.final_conversation(store.history(source))
     if not messages:
         raise ExportError("No User/Agent text was found")
     lineage = store.lineages[source.rollout_id]

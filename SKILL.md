@@ -29,7 +29,7 @@ On success, return a clickable Markdown link to the script's absolute output pat
 
 ## Content contract
 
-- Preserve User and Agent text, including commentary and final answers, in source order and original language. Preserve code, whitespace, lists, tables, and links. Do not summarize, translate, extract lessons, shorten, or truncate answers.
+- Preserve actual User prompts and complete Agent final answers in source order and original language; exclude commentary and progress updates. Preserve code, whitespace, lists, tables, and links. Do not summarize, translate, extract lessons, shorten, or truncate answers.
 - Include only the invoking session's ancestry, excluding parent changes after each fork and sibling branches.
 - Remove system/developer messages, injected environment/AGENTS/skill context, reasoning, tool traffic, and mirrored log copies. Preserve actual repeated conversation messages and user-authored quotations of instructions.
 - Generate only English framing: `Session`, `Created`, `Exported`, `Lineage`, `History`, `Current`, `User`, `Agent`, and `unknown`. Each source session gets one History section; the invoking session gets Current. Same-session rollout continuations do not create new branch sections.
@@ -38,6 +38,7 @@ On success, return a clickable Markdown link to the script's absolute output pat
 
 - A session ID can span several rollout files. `history_base` refers to a rollout identity and a byte/ordinal cutoff, not necessarily a different session. The exporter resolves these references before selecting visible messages; never export only the latest file.
 - Missing sources, ambiguous lineage, invalid boundaries, and malformed complete records are errors. Report the concrete failure; do not replace missing original text with compacted summaries or claim completeness.
+- Final answers use recorded `phase: final_answer`. For older unphased messages, the exporter matches original text against the turn's completion record after reconstructing history. Missing completion evidence is an error, not permission to include all assistant messages. User-part provenance distinguishes injected rules from genuinely authored quotations; legacy records use complete injection envelopes.
 - The export freezes the available source prefixes. It cannot include the answer written after it runs. An unfinished JSONL record is an error; retry when the writer has finished it.
 
 The script needs Python 3.10+ and the standard library. It reads local Codex files and writes one Markdown file; no uploads, imports, source modifications, or model API calls occur. When auditing or changing history resolution, read [the upstream algorithm provenance](references/upstream.md); ordinary exports do not need that reference.

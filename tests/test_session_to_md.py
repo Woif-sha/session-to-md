@@ -28,11 +28,14 @@ def meta(sid, ordinal=0, **extra):
     }}
 
 
-def message(role, text, ordinal=1, item_id=None):
-    return {"type": "response_item", "ordinal": ordinal, "payload": {
+def message(role, text, ordinal=1, item_id=None, *, phase="final_answer"):
+    record = {"type": "response_item", "ordinal": ordinal, "payload": {
         "type": "message", "role": role, "id": item_id,
         "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}],
     }}
+    if role == "assistant" and phase is not None:
+        record["payload"]["phase"] = phase
+    return record
 
 
 def event(role, text, ordinal=1):
@@ -43,6 +46,15 @@ def event(role, text, ordinal=1):
 
 def turn(identifier, ordinal):
     return {"type": "turn_context", "ordinal": ordinal, "payload": {"turn_id": identifier}}
+
+
+def complete(identifier, text, ordinal):
+    return {"type": "event_msg", "ordinal": ordinal, "payload": {
+        "type": "task_complete", "turn_id": identifier, "last_agent_message": text,
+    }}
+
+
+AGENTS = "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n<!-- AGENTMD_START -->\nINJECTED_RULE\n<!-- AGENTMD_END -->\n</INSTRUCTIONS>"
 
 
 def encoded(records):
@@ -80,15 +92,15 @@ class ExportTests(unittest.TestCase):
         text = "  完整回复\n\n```python\nprint('中文')\n```\n" + "实践内容🚀" * 15000 + "\n  "
         self.write(CURRENT, [meta(CURRENT), turn("a", 1),
             message("system", "SYSTEM_SECRET", 2), message("developer", "DEVELOPER_SECRET", 3),
-            message("user", "# AGENTS.md instructions for C:/project\nINJECTED_RULE", 4),
+            message("user", AGENTS.replace("instructions\n", "instructions for C:/project\n"), 4),
             message("user", "<environment_context>INJECTED_ENV</environment_context>", 5),
             message("user", "<external_codex_apps_open_page>{}</external_codex_apps_open_page>", 6),
             message("user", "用户提问", 7),
             {"type": "response_item", "ordinal": 8, "payload": {"type": "function_call_output", "output": "TOOL_SECRET"}},
-            message("assistant", "过程中的实践判断", 9), message("assistant", text, 10)])
+            message("assistant", "过程中的实践判断", 9, phase="commentary"), message("assistant", text, 10)])
         output = self.export()
-        self.assertIn(text, output)
-        self.assertIn("过程中的实践判断", output)
+        self.assertTrue(text in output, "The complete original long answer must survive")
+        self.assertFalse("过程中的实践判断" in output)
         for secret in ("SYSTEM_SECRET", "DEVELOPER_SECRET", "INJECTED_RULE", "INJECTED_ENV", "TOOL_SECRET", "external_codex_apps_open_page"):
             self.assertNotIn(secret, output)
 
@@ -139,9 +151,150 @@ class ExportTests(unittest.TestCase):
 
     def test_user_authored_instruction_quotes_are_not_injection(self):
         text = "# AGENTS.md instructions for example\n这段是用户主动提供的材料。"
-        self.write(CURRENT, [meta(CURRENT), turn("a", 1), event("user", text, 2),
-                             message("user", text, 3), message("assistant", "答复", 4)])
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1),
+                             message("user", text, 2), message("assistant", "答复", 3)])
         self.assertIn(text, self.export())
+
+    def test_explicit_commentary_and_its_event_mirror_are_excluded(self):
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+            message("assistant", "PROGRESS", 3, phase="commentary"), event("assistant", "PROGRESS", 4),
+            message("assistant", "FINAL_PART_ONE", 5), message("assistant", "FINAL_PART_TWO", 6),
+            event("assistant", "FINAL_PART_TWO", 7)])
+        output = self.export()
+        self.assertNotIn("PROGRESS", output)
+        self.assertEqual(output.count("FINAL_PART_ONE"), 1)
+        self.assertEqual(output.count("FINAL_PART_TWO"), 1)
+
+    def test_rules_provenance_filters_parts_and_preserves_authored_quotes(self):
+        record = message("user", "unused", 2)
+        quote = AGENTS.replace("INJECTED_RULE", "AUTHORED_RULE_QUOTE")
+        record["payload"]["content"] = [
+            {"type": "input_text", "text": AGENTS},
+            {"type": "input_text", "text": "<environment_context>INJECTED_ENV</environment_context>"},
+            {"type": "input_text", "text": quote},
+        ]
+        record["payload"]["internal_chat_message_metadata_passthrough"] = {
+            "content_item_kinds": ["agents_md.instructions", "environments.environment_context", "user.text"],
+        }
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1), record, message("assistant", "ANSWER", 3)])
+        output = self.export()
+        self.assertIn(quote, output)
+        self.assertNotIn("INJECTED_RULE", output)
+        self.assertNotIn("INJECTED_ENV", output)
+
+    def test_legacy_rule_envelopes_are_filtered_on_both_input_paths(self):
+        for source in (message, event):
+            with self.subTest(source=source.__name__):
+                text = "<environment_context>INJECTED_ENV</environment_context>\n\n" + AGENTS + "\n\nACTUAL_QUESTION"
+                self.write(CURRENT, [meta(CURRENT), turn("a", 1), source("user", text, 2),
+                                     message("assistant", "ACTUAL_ANSWER", 3)])
+                output = self.export()
+                self.assertIn("ACTUAL_QUESTION", output)
+                self.assertIn("ACTUAL_ANSWER", output)
+                self.assertNotIn("INJECTED_RULE", output)
+                self.assertNotIn("INJECTED_ENV", output)
+
+    def test_completion_selects_unphased_original_answer_without_synthesis(self):
+        original = "  完整原文\n\n```python\nprint('内容')\n```\n  "
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+            message("assistant", "LEGACY_PROGRESS", 3, phase=None), event("assistant", "LEGACY_PROGRESS", 4),
+            message("assistant", original, 5, phase=None), event("assistant", original, 6),
+            complete("a", original.strip(), 7)])
+        output = self.export()
+        self.assertIn(original, output)
+        self.assertNotIn("LEGACY_PROGRESS", output)
+        self.assertEqual(output.count(original), 1)
+
+    def test_unphased_answer_without_completion_is_reported_as_ambiguous(self):
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+                             message("assistant", "UNKNOWN_PHASE", 3, phase=None)])
+        with self.assertRaisesRegex(exporter.ExportError, "final answer"):
+            self.export()
+        self.assertFalse(self.output.exists())
+
+    def test_completion_can_follow_original_in_next_rollout(self):
+        prefix = [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+                  message("assistant", "LEGACY_PROGRESS", 3, phase=None),
+                  message("assistant", "VERBATIM_FINAL", 4, phase=None)]
+        self.write(CURRENT, prefix)
+        self.write(CURRENT, [meta(CURRENT, 5, history_base=boundary(CURRENT, prefix)),
+                             complete("a", "VERBATIM_FINAL", 6)], rollout_id=ROLLOUT)
+        output = self.export()
+        self.assertIn("VERBATIM_FINAL", output)
+        self.assertNotIn("LEGACY_PROGRESS", output)
+
+    def test_copied_final_keeps_parent_evidence_when_completion_is_not_copied(self):
+        prefix = [meta(ROOT, history_mode="legacy"), turn("a", 1), message("user", "ROOT_QUESTION", 2),
+                  message("assistant", "ROOT_FINAL", 3, phase=None)]
+        self.write(ROOT, prefix + [complete("a", "ROOT_FINAL", 4)])
+        self.write(CURRENT, [meta(CURRENT, history_mode="legacy", forked_from_id=ROOT), *prefix,
+                             turn("b", 4), message("user", "CHILD_QUESTION", 5), message("assistant", "CHILD_FINAL", 6)])
+        output = self.export()
+        self.assertEqual(output.count("ROOT_FINAL"), 1)
+        self.assertEqual(output.count("CHILD_FINAL"), 1)
+
+    def test_authored_rule_quote_and_its_event_mirror_appear_once(self):
+        text = AGENTS + "\n\nExplain the quoted rules."
+        response = message("user", text, 3)
+        response["payload"]["internal_chat_message_metadata_passthrough"] = {
+            "content_item_kinds": ["user.text"],
+        }
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1), event("user", text, 2),
+                             response, message("assistant", "ANSWER", 4)])
+        output = self.export()
+        self.assertEqual(output.count("Explain the quoted rules."), 1)
+        self.assertIn(text, output)
+
+    def test_phase_evidence_survives_body_mirror_selection(self):
+        final_event = event("assistant", "ANSWER", 4)
+        final_event["payload"]["phase"] = "final_answer"
+        self.write(CURRENT, [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+                             message("assistant", "ANSWER", 3, phase=None), final_event])
+        self.assertEqual(self.export().count("ANSWER"), 1)
+
+    def test_empty_completion_evidence_can_cross_rollout_boundary(self):
+        prefix = [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+                  message("assistant", "LEGACY_PROGRESS", 3, phase=None)]
+        self.write(CURRENT, prefix)
+        completion = complete("a", None, 5)
+        del completion["payload"]["turn_id"]
+        self.write(CURRENT, [meta(CURRENT, 4, history_base=boundary(CURRENT, prefix)), completion], rollout_id=ROLLOUT)
+        output = self.export()
+        self.assertIn("QUESTION", output)
+        self.assertNotIn("LEGACY_PROGRESS", output)
+
+    def test_missing_original_final_is_not_silently_omitted_or_synthesized(self):
+        for assistant_records in ([], [message("assistant", "PARTIAL", 3, phase=None)]):
+            with self.subTest(has_partial=bool(assistant_records)):
+                self.write(CURRENT, [meta(CURRENT), turn("a", 1), message("user", "QUESTION", 2),
+                                     *assistant_records, complete("a", "MISSING_ORIGINAL", 4)])
+                with self.assertRaisesRegex(exporter.ExportError, "Missing original final answer"):
+                    self.export()
+                self.assertFalse(self.output.exists())
+
+    def test_copied_fork_does_not_require_parent_completion_after_its_boundary(self):
+        prefix = [meta(ROOT, history_mode="legacy"), turn("a", 1), message("user", "ROOT_QUESTION", 2),
+                  message("assistant", "ROOT_FINAL", 3)]
+        self.write(ROOT, prefix + [complete("a", "ROOT_FINAL", 4), turn("future", 5),
+                                  message("user", "PARENT_LATER", 6), complete("future", "NOT_COPIED", 7)])
+        self.write(CURRENT, [meta(CURRENT, history_mode="legacy", forked_from_id=ROOT), *prefix,
+                             turn("b", 4), message("user", "CHILD_QUESTION", 5), message("assistant", "CHILD_FINAL", 6)])
+        output = self.export()
+        self.assertNotIn("PARENT_LATER", output)
+        self.assertNotIn("NOT_COPIED", output)
+        self.assertIn("ROOT_FINAL", output)
+        self.assertIn("CHILD_FINAL", output)
+
+    def test_copied_progress_keeps_empty_parent_completion_evidence(self):
+        prefix = [meta(ROOT, history_mode="legacy"), turn("a", 1), message("user", "ROOT_QUESTION", 2),
+                  message("assistant", "ROOT_PROGRESS", 3, phase=None)]
+        self.write(ROOT, prefix + [complete("a", None, 4)])
+        self.write(CURRENT, [meta(CURRENT, history_mode="legacy", forked_from_id=ROOT), *prefix,
+                             turn("b", 4), message("user", "CHILD_QUESTION", 5), message("assistant", "CHILD_FINAL", 6)])
+        output = self.export()
+        self.assertIn("ROOT_QUESTION", output)
+        self.assertNotIn("ROOT_PROGRESS", output)
+        self.assertIn("CHILD_FINAL", output)
 
     def test_mirror_can_straddle_same_session_rollout_boundary(self):
         prefix = [meta(CURRENT), turn("a", 1), event("user", "QUESTION_ONCE", 2)]
