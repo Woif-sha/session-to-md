@@ -1,4 +1,6 @@
 interface:
   display_name: "Session to MD"
-  short_description: "Export complete session ancestry as User/Agent Markdown"
-  default_prompt: "Use $session-to-md to export this session and its inherited history as one Markdown file."
+  short_description: "Manually export this conversation to one Markdown file"
+  default_prompt: "$session-to-md"
+policy:
+  allow_implicit_invocation: false
