@@ -40,9 +40,9 @@ def build(version: str, destination: Path):
         f"# [**v{version}**]({REPOSITORY}/releases/tag/v{version})\n\n"
         f"## 更新内容\n\n{section.group(1).strip()}\n\n"
         "## 安装与更新\n\n"
-        f"下载本页的 `session-to-md-v{version}.zip`，将其中的 `session-to-md` 文件夹解压到 `~/.agents/skills/`。\n\n"
-        "也可以使用 Git 安装：\n\n```powershell\n"
-        f'git clone {REPOSITORY}.git "$HOME/.agents/skills/session-to-md"\n```\n\n'
+        f"下载本页的 `session-to-md-v{version}.zip`，将其中的 `session-to-md` 文件夹放入你使用的 skills 目录。\n\n"
+        "也可以在你使用的 skills 目录中通过 Git 安装：\n\n```powershell\n"
+        f"git clone {REPOSITORY}.git\n```\n\n"
         "安装后在目标 Codex 会话中手动调用 `$session-to-md`，无需附加参数。已有 Git 安装可执行 `git pull --ff-only` 更新。\n\n"
         "## 发布校验\n\n"
         "- 发布工作流在构建前运行完整行为测试。\n"

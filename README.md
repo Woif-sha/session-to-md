@@ -26,23 +26,13 @@ session-exports/session-<current-session-id>.md
 
 需要 Python 3.10 或更高版本，且 Codex 能在终端中运行 `python`。导出脚本只依赖 Python 标准库，无需单独的 API Key 或第三方 Python 包。
 
-### 使用 Git
-
-将仓库克隆到全局 skills 目录：
+将仓库克隆到你使用的 skills 目录：
 
 ```powershell
-git clone https://github.com/Woif-sha/session-to-md.git "$HOME/.agents/skills/session-to-md"
+git clone https://github.com/Woif-sha/session-to-md.git
 ```
 
-如果目标目录已经存在，先确认其中是否包含自己的修改，不要直接覆盖。
-
-### 使用安装包
-
-从 [Releases](https://github.com/Woif-sha/session-to-md/releases) 下载 `session-to-md-vX.Y.Z.zip`，将其中的 `session-to-md` 文件夹解压到 `~/.agents/skills/`。安装后的入口应为：
-
-```text
-~/.agents/skills/session-to-md/SKILL.md
-```
+也可以从 [Releases](https://github.com/Woif-sha/session-to-md/releases) 下载 `session-to-md-vX.Y.Z.zip`，将其中的 `session-to-md` 文件夹放入你使用的 skills 目录。
 
 如果 Codex 的 skill 列表尚未出现它，重新启动 Codex 后再手动选择。
 
