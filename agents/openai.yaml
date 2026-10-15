@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session to MD"
+  short_description: "Export complete session ancestry as User/Agent Markdown"
+  default_prompt: "Use $session-to-md to export this session and its inherited history as one Markdown file."
